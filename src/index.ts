@@ -10,7 +10,7 @@ export interface Config {
   codexRedirectPort?: number
 }
 
-export const name = '@wang-kaopu/dsh-oauth'
+export const name = '@kelvinwww/dsh-oauth'
 export const inject = ['credentials', 'llm'] as const
 
 interface ControlDependencies {

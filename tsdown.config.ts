@@ -1,6 +1,16 @@
 import { defineConfig } from 'tsdown'
 
-const PACKAGE_NAME = '@wang-kaopu/dsh-oauth'
+const PACKAGE_NAME = '@kelvinwww/dsh-oauth'
+
+const CLIENT_EXTERNALS = new Set([
+  'react',
+  'react/jsx-runtime',
+  'react-dom',
+  'react-dom/client',
+  '@deepseek-ai/cordis',
+  '@deepseek-ai/dsh-client-ui-slots',
+  '@deepseek-ai/dsh-client-ui-primitives',
+])
 
 export default defineConfig({
   name: `${PACKAGE_NAME}/client`,
@@ -15,15 +25,9 @@ export default defineConfig({
   dts: false,
   clean: false,
   sourcemap: true,
-  external: [
-    'react',
-    'react/jsx-runtime',
-    'react-dom',
-    'react-dom/client',
-    '@deepseek-ai/cordis',
-    '@deepseek-ai/dsh-client-ui-slots',
-    '@deepseek-ai/dsh-client-ui-primitives',
-  ],
+  deps: {
+    neverBundle: (specifier: string) => CLIENT_EXTERNALS.has(specifier),
+  },
   outputOptions: {
     entryFileNames: 'client.js',
     banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(PACKAGE_NAME)}, factory: (require) => {`,

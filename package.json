@@ -1,5 +1,5 @@
 {
-  "name": "@wang-kaopu/dsh-oauth",
+  "name": "@kelvinwww/dsh-oauth",
   "version": "0.1.0",
   "description": "OAuth bridge plugin for DeepSeek Harness Codex and Gemini CLI routes",
   "type": "module",
@@ -46,6 +46,10 @@
     "cordis.patch.yml",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsdown",
     "bundle": "tsdown",

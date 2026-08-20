@@ -9,7 +9,7 @@ DSH OAuth Bridge 是一个 DeepSeek Harness 插件，通过浏览器 OAuth 接�
 直接将插件加入 DSH 的 `web` profile：
 
 ```sh
-dsh plugin --profile web add @wang-kaopu/dsh-oauth
+npx @deepseek-ai/dsh plugin --profile web add @kelvinwww/dsh-oauth
 ```
 
 ## 开发
