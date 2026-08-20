@@ -25,7 +25,8 @@
     "./gemini": {
       "types": "./lib/gemini.d.ts",
       "default": "./lib/gemini.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "dsh": {
     "bundle": {
