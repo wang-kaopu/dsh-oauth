@@ -1,5 +1,5 @@
 {
-  "name": "@deepseek-ai/dsh-oauth-bridge",
+  "name": "@wang-kaopu/dsh-oauth",
   "version": "0.1.0",
   "description": "OAuth bridge plugin for DeepSeek Harness Codex and Gemini CLI routes",
   "type": "module",
@@ -27,18 +27,32 @@
       "default": "./lib/gemini.js"
     }
   },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
   "files": [
     "lib",
     "cordis.patch.yml",
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && tsdown",
+    "bundle": "tsdown",
+    "watch:client": "tsdown --watch",
     "check": "tsc --noEmit",
     "test": "vitest run"
   },
   "engines": {
-    "node": ">=20"
+    "node": "^22.19.0 || >=24.11.0"
   },
   "dependencies": {
     "@deepseek-ai/dsh-atomic-write": "0.1.0-rc.8",
@@ -48,14 +62,19 @@
     "google-auth-library": "10.9.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.1.0-rc.8"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.1",
     "@deepseek-ai/dsh-brand": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-runtime": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-settings": "0.1.0-rc.8",
     "@deepseek-ai/dsh-invariants": "0.1.0-rc.8",
     "@deepseek-ai/dsh-llm": "0.1.0-rc.8",
     "@types/node": "22.15.0",
+    "tsdown": "^0.22.2",
     "typescript": "5.8.3",
     "vitest": "3.2.4"
   }

@@ -9,6 +9,21 @@ export interface OAuthBridgeClient {
   logout(provider: 'codex' | 'gemini'): Promise<void>
 }
 
+export const inject = ['slots'] as const
+
+interface ReactRuntime {
+  createElement(type: unknown, props?: Record<string, unknown> | null, ...children: unknown[]): unknown
+  useEffect(effect: () => void | (() => void), dependencies: readonly unknown[]): void
+  useState<T>(initial: T): [T, (value: T | ((previous: T) => T)) => void]
+}
+
+interface ClientContext {
+  slots: {
+    inject(name: string, register: () => unknown): unknown
+    register(options: Record<string, unknown>, component: unknown): unknown
+  }
+}
+
 /**
  * Create the browser-side client for the loopback OAuth control server.
  *
@@ -28,15 +43,119 @@ export function createOAuthBridgeClient(baseUrl = 'http://127.0.0.1:1456'): OAut
       return await call('/status', 'GET') as unknown as OAuthStatus
     },
     async login(provider) {
-      const result = await call(`/auth/${provider}/start`, 'POST')
-      const authUrl = result.authUrl
-      if (typeof authUrl !== 'string') throw new Error('OAuth control response did not include authUrl')
-      window.open(authUrl, '_blank')
+      const popup = window.open('about:blank', '_blank')
+      if (!popup) throw new Error('OAuth popup was blocked')
+      try {
+        const result = await call(`/auth/${provider}/start`, 'POST')
+        const authUrl = result.authUrl
+        if (typeof authUrl !== 'string') throw new Error('OAuth control response did not include authUrl')
+        popup.location.href = authUrl
+      } catch (error) {
+        popup.close()
+        throw error
+      }
     },
     async logout(provider) {
       await call(`/auth/${provider}/logout`, 'POST')
     },
   }
+}
+
+/** Poll the loopback status endpoint until the browser callback has persisted credentials. */
+async function waitForAuthentication(provider: 'codex' | 'gemini', client: OAuthBridgeClient, timeout = 60_000): Promise<OAuthStatus> {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const status = await client.status()
+    if (status[provider].authenticated) return status
+    await new Promise(resolve => setTimeout(resolve, 1_000))
+  }
+  throw new Error(`${provider} OAuth callback was not completed before the status polling timeout`)
+}
+
+/** Resolve React from the DSH client module table only when the settings component renders. */
+function reactRuntime(): ReactRuntime {
+  if (typeof require !== 'function') throw new Error('DSH OAuth client requires the DSH React runtime')
+  return require('react') as ReactRuntime
+}
+
+/** Render the OAuth provider controls used by the DSH settings slot. */
+function OAuthProviderPanel(): unknown {
+  const React = reactRuntime()
+  const client = createOAuthBridgeClient()
+  const [status, setStatus] = React.useState<OAuthStatus | undefined>(undefined)
+  const [busy, setBusy] = React.useState<'codex' | 'gemini' | undefined>(undefined)
+  const [error, setError] = React.useState<string | undefined>(undefined)
+
+  const refresh = async (): Promise<void> => {
+    try {
+      setStatus(await client.status())
+      setError(undefined)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'OAuth control server is unavailable')
+    }
+  }
+
+  React.useEffect(() => {
+    let active = true
+    const poll = async (): Promise<void> => {
+      try {
+        const next = await client.status()
+        if (active) {
+          setStatus(next)
+          setError(undefined)
+        }
+      } catch (cause) {
+        if (active) setError(cause instanceof Error ? cause.message : 'OAuth control server is unavailable')
+      }
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), 1_000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [])
+
+  const handleAction = async (provider: 'codex' | 'gemini'): Promise<void> => {
+    setBusy(provider)
+    try {
+      if (status?.[provider].authenticated) await client.logout(provider)
+      else {
+        await client.login(provider)
+        await waitForAuthentication(provider, client)
+      }
+      await refresh()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'OAuth operation failed')
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const row = (provider: 'codex' | 'gemini', title: string, loginLabel: string): unknown => {
+    const authenticated = status?.[provider].authenticated === true
+    return React.createElement('div', { key: provider, style: { display: 'flex', alignItems: 'center', gap: '12px', marginTop: '10px' } },
+      React.createElement('strong', null, title),
+      React.createElement('span', { style: { flex: 1 } }, authenticated ? '● Connected' : '○ Not connected'),
+      React.createElement('button', { type: 'button', disabled: busy !== undefined, onClick: () => void handleAction(provider) }, busy === provider ? 'Working…' : authenticated ? 'Logout' : loginLabel),
+    )
+  }
+
+  return React.createElement('section', { style: { padding: '16px', border: '1px solid var(--border, #d7dce2)', borderRadius: '8px', marginBottom: '16px' } },
+    React.createElement('h2', { style: { margin: 0 } }, 'OAuth Providers'),
+    row('codex', 'Codex', 'Login with ChatGPT'),
+    row('gemini', 'Gemini CLI', 'Login with Google'),
+    error === undefined ? null : React.createElement('p', { role: 'alert', style: { color: '#b42318', marginBottom: 0 } }, error),
+  )
+}
+
+/**
+ * Register the OAuth panel in the DSH Web settings surface.
+ *
+ * @param ctx - DSH client context providing the settings slot registry.
+ */
+export function apply(ctx: ClientContext): void {
+  ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'dsh-oauth', order: 5, label: 'OAuth Providers' }, OAuthProviderPanel))
 }
 
 /**
@@ -61,7 +180,10 @@ export async function renderOAuthProviders(container: HTMLElement, client = crea
     button.textContent = status[provider].authenticated ? 'Logout' : provider === 'codex' ? 'Login with ChatGPT' : 'Login with Google'
     button.addEventListener('click', async () => {
       if (status[provider].authenticated) await client.logout(provider)
-      else await client.login(provider)
+      else {
+        await client.login(provider)
+        await waitForAuthentication(provider, client)
+      }
       await renderOAuthProviders(container, client)
     })
     row.append(title, state, button)

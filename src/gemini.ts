@@ -53,14 +53,39 @@ interface CodeAssistTier {
   isDefault?: boolean
 }
 
-interface CodeAssistData {
-  currentTier?: { cloudaicompanionProject?: string }
-  allowedTiers?: CodeAssistTier[]
-  cloudaicompanionProject?: string
+interface IneligibleTier {
+  reasonCode?: string
+  validationUrl?: string
+}
+
+interface CodeAssistError {
+  code?: number
+  status?: string
+  message?: string
+}
+
+interface LoadCodeAssistResponse {
+  currentTier?: CodeAssistTier | null
+  allowedTiers?: CodeAssistTier[] | null
+  ineligibleTiers?: IneligibleTier[] | null
+  cloudaicompanionProject?: string | null
+  paidTier?: CodeAssistTier | null
+}
+
+interface OnboardOperationResponse {
   done?: boolean
   name?: string
-  response?: CodeAssistData
-  error?: { code?: number; status?: string; message?: string }
+  response?: {
+    cloudaicompanionProject?: {
+      id?: string
+      name?: string
+    }
+  }
+  error?: CodeAssistError
+}
+
+interface CodeAssistErrorResponse {
+  error?: CodeAssistError
 }
 
 interface GeminiRequestOptions {
@@ -196,11 +221,25 @@ function selectedProjectId(stored: GeminiCredential | undefined): string | undef
   return value
 }
 
-function errorCodeFromResponse(error: CodeAssistData['error'] | undefined, fallback: string): string {
+function errorCodeFromResponse(error: CodeAssistError | undefined, fallback: string): string {
   const value = `${error?.status ?? ''} ${error?.message ?? ''}`.toUpperCase()
   if (value.includes('VALIDATION')) return 'GEMINI_VALIDATION_REQUIRED'
   if (value.includes('ELIGIBLE')) return 'GEMINI_ACCOUNT_NOT_ELIGIBLE'
   return fallback
+}
+
+/** Map Code Assist account eligibility reasons to the bridge's stable error codes. */
+function ineligibleTierErrorCode(tiers: IneligibleTier[] | null | undefined): string | undefined {
+  if (!tiers?.length) return undefined
+  if (tiers.some(tier => tier.reasonCode === 'VALIDATION_REQUIRED')) return 'GEMINI_VALIDATION_REQUIRED'
+  return 'GEMINI_ACCOUNT_NOT_ELIGIBLE'
+}
+
+/** Extract the structured Gaxios response needed for stable provider error classification. */
+function errorResponse(error: unknown): { status?: number; data?: CodeAssistErrorResponse } {
+  const response = (error as { response?: { status?: number; data?: unknown } }).response
+  const data = typeof response?.data === 'object' && response.data !== null ? response.data as CodeAssistErrorResponse : undefined
+  return { status: response?.status, data }
 }
 
 function responseHtml(message: string): string {
@@ -240,10 +279,11 @@ function isFreeTier(tier: CodeAssistTier): boolean {
 function contentParts(message: Message, toolNames: ReadonlyMap<string, string>): Record<string, unknown>[] {
   const parts: Record<string, unknown>[] = []
   for (const block of message.content) {
-    if (block.type === 'text' || block.type === 'reasoning') {
+    if (block.type === 'text') {
       parts.push({ text: block.text })
       continue
     }
+    if (block.type === 'reasoning') throw geminiError('Gemini does not support reasoning history', 'GEMINI_REASONING_HISTORY_UNSUPPORTED')
     if (block.type === 'tool-call') {
       let args: unknown = {}
       try {
@@ -259,6 +299,7 @@ function contentParts(message: Message, toolNames: ReadonlyMap<string, string>):
       for (const result of block.content) {
         if (result.type === 'text') response.output = `${response.output ?? ''}${result.text}`
       }
+      if (block.isError) response.error = true
       parts.push({ functionResponse: { name: toolNames.get(block.toolCallId) ?? block.toolCallId, response } })
       continue
     }
@@ -392,14 +433,15 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
     try {
       const response = await oauthClient.request<T>({ ...options, headers: { ...(options.headers ?? {}), 'content-type': options.headers?.['content-type'] ?? 'application/json' } }) as unknown as GeminiRequestResponse<T>
       if (response.status !== undefined && response.status >= 400) {
-        const data = response.data as unknown as CodeAssistData
+        const data = response.data as unknown as CodeAssistErrorResponse
         throw geminiError('Gemini Code Assist request failed', errorCodeFromResponse(data.error, 'GEMINI_HTTP_ERROR'), undefined, response.status)
       }
       return response.data
     } catch (error) {
       if ((error as { code?: string }).code?.startsWith('GEMINI_')) throw error
-      const status = (error as { response?: { status?: number } }).response?.status
-      throw geminiError(status === 401 ? 'Gemini authentication is required' : 'Gemini Code Assist request failed', status === 401 ? 'GEMINI_AUTH_REQUIRED' : 'GEMINI_HTTP_ERROR', error, status)
+      const { status, data } = errorResponse(error)
+      const code = status === 401 ? 'GEMINI_AUTH_REQUIRED' : errorCodeFromResponse(data?.error, 'GEMINI_HTTP_ERROR')
+      throw geminiError(status === 401 ? 'Gemini authentication is required' : 'Gemini Code Assist request failed', code, error, status)
     }
   }
 
@@ -411,8 +453,9 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
       return response.data
     } catch (error) {
       if ((error as { code?: string }).code?.startsWith('GEMINI_')) throw error
-      const status = (error as { response?: { status?: number } }).response?.status
-      throw geminiError(status === 401 ? 'Gemini authentication is required' : 'Gemini stream request failed', status === 401 ? 'GEMINI_AUTH_REQUIRED' : 'GEMINI_HTTP_ERROR', error, status)
+      const { status, data } = errorResponse(error)
+      const code = status === 401 ? 'GEMINI_AUTH_REQUIRED' : errorCodeFromResponse(data?.error, 'GEMINI_HTTP_ERROR')
+      throw geminiError(status === 401 ? 'Gemini authentication is required' : 'Gemini stream request failed', code, error, status)
     }
   }
 
@@ -425,9 +468,16 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
       cloudaicompanionProject: localProjectId,
       metadata: { ideType: 'IDE_UNSPECIFIED', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI', ...(localProjectId === undefined ? {} : { duetProject: localProjectId }) },
     }
-    const load = await requestJson<CodeAssistData>({ url: getMethodUrl('loadCodeAssist'), method: 'POST', body: JSON.stringify(request), headers: attributionHeaders(), signal })
-    let resolvedProject = load.currentTier?.cloudaicompanionProject ?? load.cloudaicompanionProject ?? localProjectId
+    const load = await requestJson<LoadCodeAssistResponse>({ url: getMethodUrl('loadCodeAssist'), method: 'POST', body: JSON.stringify(request), headers: attributionHeaders(), signal })
+    let resolvedProject = load.cloudaicompanionProject ?? localProjectId
     if (!load.currentTier) {
+      const ineligibleCode = ineligibleTierErrorCode(load.ineligibleTiers)
+      if (ineligibleCode) {
+        const message = ineligibleCode === 'GEMINI_VALIDATION_REQUIRED'
+          ? 'Gemini Code Assist account validation is required'
+          : 'Gemini Code Assist account is not eligible'
+        throw geminiError(message, ineligibleCode)
+      }
       const tier = load.allowedTiers?.find(candidate => candidate.isDefault)
       if (!tier?.id) throw geminiError('Gemini Code Assist returned no default tier', 'GEMINI_NO_ALLOWED_TIER')
       if (!isFreeTier(tier) && !localProjectId) throw geminiError('A Google Cloud project is required for the selected Gemini tier', 'GEMINI_PROJECT_REQUIRED')
@@ -436,17 +486,17 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
         ...(isFreeTier(tier) ? {} : { cloudaicompanionProject: localProjectId }),
         metadata: { ideType: 'IDE_UNSPECIFIED', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI', ...(isFreeTier(tier) ? {} : { duetProject: localProjectId }) },
       }
-      let operation = await requestJson<CodeAssistData>({ url: getMethodUrl('onboardUser'), method: 'POST', body: JSON.stringify(onboardRequest), headers: attributionHeaders(), signal })
+      let operation = await requestJson<OnboardOperationResponse>({ url: getMethodUrl('onboardUser'), method: 'POST', body: JSON.stringify(onboardRequest), headers: attributionHeaders(), signal })
       if (operation.done === false && operation.name) {
         const deadline = Date.now() + 60_000
         while (!operation.done && Date.now() < deadline) {
           await delay(5_000, signal)
-          operation = await requestJson<CodeAssistData>({ url: `${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}/${operation.name}`, method: 'GET', headers: attributionHeaders(), signal })
+          operation = await requestJson<OnboardOperationResponse>({ url: `${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}/${operation.name}`, method: 'GET', headers: attributionHeaders(), signal })
         }
         if (!operation.done) throw geminiError('Gemini Code Assist onboarding timed out', 'GEMINI_ONBOARDING_TIMEOUT')
       }
       if (operation.error) throw geminiError('Gemini Code Assist onboarding failed', errorCodeFromResponse(operation.error, 'GEMINI_ONBOARDING_FAILED'))
-      resolvedProject = operation.response?.cloudaicompanionProject ?? operation.cloudaicompanionProject ?? localProjectId
+      resolvedProject = operation.response?.cloudaicompanionProject?.id ?? localProjectId
     }
     if (!resolvedProject) throw geminiError('Gemini Code Assist did not return a project ID', 'GEMINI_PROJECT_REQUIRED')
     if (projectIdIsNumeric(resolvedProject)) throw geminiError('Gemini Code Assist returned a project number instead of a project ID', 'GEMINI_INVALID_PROJECT_ID')
@@ -569,6 +619,7 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
  */
 export async function* streamGemini(transport: GeminiTransport, options: GenerateOptions): AsyncIterable<StreamChunk> {
   if (options.signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError')
+  if (options.reasoningEffort !== undefined) throw geminiError('Gemini reasoning effort is not supported', 'UNSUPPORTED_REASONING_EFFORT')
   const project = await transport.getProjectId(options.signal)
   const request = toGenerateRequest(options, project)
   const stream = await transport.requestStream({
@@ -659,8 +710,11 @@ export class GeminiCliAdapter extends LlmAdapter {
    * @param provider - provider route being queried.
    * @returns no fabricated model IDs.
    */
-  async listModels(provider: string): Promise<readonly []> {
+  async listModels(provider: string): Promise<readonly { provider: string; id: string; name: string }[]> {
     if (provider !== 'gemini-cli-oauth') return []
-    return []
+    return [
+      { provider, id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+      { provider, id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+    ]
   }
 }

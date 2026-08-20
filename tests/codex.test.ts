@@ -32,7 +32,10 @@ async function home(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'dsh-oauth-codex-'))
 }
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.useRealTimers()
+})
 
 describe('Codex OAuth', () => {
   it('creates a correct PKCE S256 challenge', () => {
@@ -86,6 +89,77 @@ describe('Codex OAuth', () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'refresh_token_expired' }), { status: 400 })))
     await saveCodexCredential({ accessToken: 'old', refreshToken: 'old-refresh', expiresAt: 0, accountId: 'account' }, dshHome)
     await expect(service.getCodexAccessToken()).rejects.toMatchObject({ code: 'CODEX_AUTH_REQUIRED' })
+    expect(await loadCodexCredential(dshHome)).toBeUndefined()
+    expect(ctx.credentials.unset).toHaveBeenCalled()
+    await service.dispose()
+  })
+
+  it('refreshes a still-valid token from the scheduled expiry window', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const dshHome = await home()
+    const ctx = context()
+    await saveCodexCredential({ accessToken: 'old', refreshToken: 'refresh', expiresAt: 120_000, accountId: 'account' }, dshHome)
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ access_token: 'new', expires_in: 3600 }), { status: 200 }))
+    vi.stubGlobal('fetch', fetch)
+    const service = createCodexService(ctx as never, { dshHome })
+
+    await service.initialize()
+    expect(ctx.values.get('DSH_OPENAI_CODEX_TOKEN')).toBe('old')
+    await vi.advanceTimersByTimeAsync(60_001)
+    vi.useRealTimers()
+    await new Promise<void>(resolve => setTimeout(resolve, 10))
+
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(ctx.values.get('DSH_OPENAI_CODEX_TOKEN')).toBe('new')
+    await service.dispose()
+  })
+
+  it('retries a transient startup refresh failure', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const dshHome = await home()
+    const ctx = context()
+    await saveCodexCredential({ accessToken: 'old', refreshToken: 'refresh', expiresAt: 0, accountId: 'account' }, dshHome)
+    let attempts = 0
+    const fetch = vi.fn(async () => {
+      attempts += 1
+      if (attempts === 1) throw new Error('temporary network failure')
+      return new Response(JSON.stringify({ access_token: 'new', expires_in: 3600 }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetch)
+    const service = createCodexService(ctx as never, { dshHome })
+
+    await service.initialize()
+    expect(fetch).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(30_001)
+    vi.useRealTimers()
+    await new Promise<void>(resolve => setTimeout(resolve, 10))
+
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(ctx.values.get('DSH_OPENAI_CODEX_TOKEN')).toBe('new')
+    await service.dispose()
+  })
+
+  it('serializes logout after an in-flight refresh', async () => {
+    const dshHome = await home()
+    const ctx = context()
+    await saveCodexCredential({ accessToken: 'old', refreshToken: 'refresh', expiresAt: 0, accountId: 'account' }, dshHome)
+    let resolveRefresh!: (response: Response) => void
+    const refreshResponse = new Promise<Response>(resolve => {
+      resolveRefresh = resolve
+    })
+    const fetch = vi.fn(() => refreshResponse)
+    vi.stubGlobal('fetch', fetch)
+    const service = createCodexService(ctx as never, { dshHome })
+
+    const refresh = service.getCodexAccessToken()
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1))
+    const logout = service.logout()
+    resolveRefresh(new Response(JSON.stringify({ access_token: 'new', expires_in: 3600 }), { status: 200 }))
+
+    await expect(refresh).resolves.toBe('new')
+    await logout
     expect(await loadCodexCredential(dshHome)).toBeUndefined()
     expect(ctx.credentials.unset).toHaveBeenCalled()
     await service.dispose()

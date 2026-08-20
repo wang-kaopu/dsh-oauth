@@ -6,4 +6,4 @@
 
 - insert:
     - id: oauth-bridge
-      name: "@deepseek-ai/dsh-oauth-bridge"
+      name: "@wang-kaopu/dsh-oauth"

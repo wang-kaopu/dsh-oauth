@@ -208,32 +208,81 @@ async function refreshCode(credential: CodexCredential): Promise<CodexCredential
 export function createCodexService(ctx: Context, config: CodexServiceConfig = {}) {
   const redirectPort = config.codexRedirectPort ?? CODEX_REDIRECT_PORT
   let pending: PendingLogin | undefined
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined
+  let credentialMutation: Promise<void> = Promise.resolve()
 
   async function setDshCredential(accessToken: string): Promise<void> {
     await ctx.credentials.set(CODEX_TOKEN_REF, accessToken)
   }
 
+  /** Cancel the pending refresh so logout and disposal cannot mutate credentials later. */
+  function clearRefreshTimer(): void {
+    if (refreshTimer === undefined) return
+    clearTimeout(refreshTimer)
+    refreshTimer = undefined
+  }
+
+  /** Schedule one refresh at the safe boundary before the access token expires. */
+  function scheduleRefresh(expiresAt: number, delayOverride?: number): void {
+    clearRefreshTimer()
+    const delay = delayOverride ?? Math.max(0, expiresAt - Date.now() - 60_000)
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined
+      void getCodexAccessToken().catch(error => {
+        const code = (error as { code?: string }).code
+        if (code === 'CODEX_AUTH_REQUIRED') {
+          ctx.logger.warn('Codex authentication is required')
+          return
+        }
+        ctx.logger.warn(`Codex scheduled token refresh failed (${code ?? 'unknown'})`)
+        void scheduleRetryIfAuthenticated().catch(retryError => {
+          const retryCode = (retryError as { code?: string }).code
+          ctx.logger.warn(`Codex retry scheduling failed (${retryCode ?? 'unknown'})`)
+        })
+      })
+    }, Math.max(0, delay))
+    refreshTimer.unref?.()
+  }
+
+  /** Serialize all credential mutations so logout cannot be overtaken by an in-flight refresh or login. */
+  function enqueueCredentialMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = credentialMutation.then(operation, operation)
+    credentialMutation = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  /** Retry a transient refresh only while the credential still exists. */
+  async function scheduleRetryIfAuthenticated(): Promise<void> {
+    await enqueueCredentialMutation(async () => {
+      if (await loadCodexCredential(config.dshHome)) scheduleRefresh(Date.now(), 30_000)
+    })
+  }
+
   async function getCodexAccessToken(): Promise<string> {
-    const stored = await loadCodexCredential(config.dshHome)
-    if (!stored) throw errorWithCode('Codex authentication is required', 'CODEX_AUTH_REQUIRED')
-    if (stored.expiresAt > Date.now() + 60_000) {
-      await setDshCredential(stored.accessToken)
-      return stored.accessToken
-    }
-    try {
-      const refreshed = await refreshCode(stored)
-      await saveCodexCredential(refreshed, config.dshHome)
-      await setDshCredential(refreshed.accessToken)
-      ctx.logger.info('Codex token refreshed')
-      return refreshed.accessToken
-    } catch (error) {
-      if ((error as { code?: string }).code === 'CODEX_AUTH_REQUIRED') {
-        await clearCodexCredential(config.dshHome)
-        await ctx.credentials.unset(CODEX_TOKEN_REF)
+    return enqueueCredentialMutation(async () => {
+      const stored = await loadCodexCredential(config.dshHome)
+      if (!stored) throw errorWithCode('Codex authentication is required', 'CODEX_AUTH_REQUIRED')
+      if (stored.expiresAt > Date.now() + 60_000) {
+        await setDshCredential(stored.accessToken)
+        scheduleRefresh(stored.expiresAt)
+        return stored.accessToken
+      }
+      try {
+        const refreshed = await refreshCode(stored)
+        await saveCodexCredential(refreshed, config.dshHome)
+        await setDshCredential(refreshed.accessToken)
+        scheduleRefresh(refreshed.expiresAt)
+        ctx.logger.info('Codex token refreshed')
+        return refreshed.accessToken
+      } catch (error) {
+        if ((error as { code?: string }).code === 'CODEX_AUTH_REQUIRED') {
+          await clearCodexCredential(config.dshHome)
+          await ctx.credentials.unset(CODEX_TOKEN_REF)
+          throw error
+        }
         throw error
       }
-      throw error
-    }
+    })
   }
 
   async function handleCallback(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -253,10 +302,14 @@ export function createCodexService(ctx: Context, config: CodexServiceConfig = {}
       if (requestUrl.searchParams.get('state') !== login.state) throw errorWithCode('Codex OAuth state did not match', 'CODEX_OAUTH_STATE_MISMATCH')
       const code = requestUrl.searchParams.get('code')
       if (!code) throw errorWithCode('Codex OAuth callback did not include a code', 'CODEX_OAUTH_FAILED')
-      const credential = await exchangeCode(code, login.verifier, login.redirectUri)
-      await saveCodexCredential(credential, config.dshHome)
-      await setDshCredential(credential.accessToken)
-      ctx.logger.info('Codex login succeeded')
+      await enqueueCredentialMutation(async () => {
+        const credential = await exchangeCode(code, login.verifier, login.redirectUri)
+        clearRefreshTimer()
+        await saveCodexCredential(credential, config.dshHome)
+        await setDshCredential(credential.accessToken)
+        scheduleRefresh(credential.expiresAt)
+        ctx.logger.info('Codex login succeeded')
+      })
       sendResponse(response, 200, 'Codex login succeeded')
     } catch (error) {
       const code = (error as { code?: string }).code ?? 'CODEX_OAUTH_FAILED'
@@ -306,17 +359,25 @@ export function createCodexService(ctx: Context, config: CodexServiceConfig = {}
         return
       }
       ctx.logger.warn('Codex startup token refresh failed')
+      await scheduleRetryIfAuthenticated()
     }
   }
 
   async function logout(): Promise<void> {
-    await clearCodexCredential(config.dshHome)
-    await ctx.credentials.unset(CODEX_TOKEN_REF)
+    clearRefreshTimer()
+    await enqueueCredentialMutation(async () => {
+      clearRefreshTimer()
+      await clearCodexCredential(config.dshHome)
+      await ctx.credentials.unset(CODEX_TOKEN_REF)
+    })
   }
 
   async function dispose(): Promise<void> {
+    clearRefreshTimer()
     if (pending) await closeServer(pending.server)
     pending = undefined
+    await credentialMutation
+    clearRefreshTimer()
   }
 
   return { startCodexLogin, getCodexAccessToken, initialize, logout, dispose }

@@ -131,7 +131,7 @@ Gemini Code Assist Adapter
 运行时：
 
 ```text
-Node.js >= 20
+Node.js ^22.19.0 || >=24.11.0
 TypeScript
 ESM
 ```
@@ -1480,9 +1480,14 @@ async listModels(provider: string) {
 }
 ```
 
-如果无法确定最新模型，允许第一版通过配置提供模型 ID。
+V0.1 固定公布已经在测试请求中使用的模型 ID：
 
-不要虚构模型 ID。
+```text
+gemini-2.5-pro
+gemini-2.5-flash
+```
+
+不做远程模型发现；模型目录是选择器提示，不构成请求白名单。
 
 ---
 
@@ -2289,6 +2294,8 @@ POST 写操作要求
 
 # 60. client.ts
 
+`client.ts` 导出 `inject = ['slots']` 和 `apply(ctx)`，通过 `settings.section` 注册 OAuth 面板。构建时将其编译为浏览器安全的 `window.__ModuleLoader__.load({ id, factory })` 客户端模块；`exports["./client"]` 指向该产物，DSH Web 会按 `dsh.client` 声明加载它。
+
 第一版 UI：
 
 ```text
@@ -2469,31 +2476,19 @@ Gemini callback port：
 
 # 65. Codex Refresh Timer
 
-允许：
+Codex service 在启动或登录后按 `expiresAt - 60 秒` 安排一次性刷新：
 
 ```text
-每 60 秒检查一次
-```
-
-但不是必须。
-
-更推荐：
-
-```text
-启动时 refresh if needed
-+
-每次需要时 refresh
-```
-
-因为 DSH Codex provider 使用 Credential seam。
-
-如果为了确保 DSH credential 始终有有效 token，可以每 60 秒执行：
-
-```ts
 getCodexAccessToken()
+        ↓
+ctx.credentials.set(DSH_OPENAI_CODEX_TOKEN)
+        ↓
+expiresAt - 60 秒
+        ↓
+再次刷新并保存 credential
 ```
 
-但不能在 refresh 未到期时频繁打 token endpoint。
+正常情况下不会在 token endpoint 未到期时重复请求；临时刷新失败会延迟重试，永久失效则清除 credential 并要求重新登录。
 
 ---
 

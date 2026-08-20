@@ -97,13 +97,13 @@ describe('Gemini OAuth and Code Assist', () => {
     const requests: Record<string, unknown>[] = []
     const client = fakeClient(async options => {
       requests.push(options)
-      return { currentTier: { cloudaicompanionProject: 'project-id' } }
+      return { currentTier: { id: 'free-tier' }, cloudaicompanionProject: 'project-id' }
     })
     const service = createGeminiService(context(), { dshHome, clientId: 'id', clientSecret: 'secret', createClient: () => client })
     await expect(service.ensureGeminiCodeAssistSetup()).resolves.toEqual({ projectId: 'project-id' })
     expect(requests[0]).toMatchObject({ url: expect.stringContaining('loadCodeAssist'), method: 'POST' })
 
-    const missingClient = fakeClient(async () => ({ currentTier: {} }))
+    const missingClient = fakeClient(async () => ({ currentTier: { id: 'free-tier' } }))
     const missingHome = await home()
     await saveGeminiCredential({ refreshToken: 'refresh' }, missingHome)
     const missingService = createGeminiService(context(), { dshHome: missingHome, clientId: 'id', clientSecret: 'secret', createClient: () => missingClient })
@@ -112,7 +112,7 @@ describe('Gemini OAuth and Code Assist', () => {
 
   it('exchanges Gemini OAuth code and rejects a mismatched state', async () => {
     const dshHome = await home()
-    const client = fakeClient(async () => ({ currentTier: { cloudaicompanionProject: 'project-id' } }))
+    const client = fakeClient(async () => ({ currentTier: { id: 'free-tier' }, cloudaicompanionProject: 'project-id' }))
     const service = createGeminiService(context(), { dshHome, clientId: 'id', clientSecret: 'secret', createClient: () => client })
     const { authUrl } = await service.startGeminiLogin()
     const redirectUri = decodeURIComponent(new URL(authUrl).searchParams.get('redirect_uri')!)
@@ -120,7 +120,7 @@ describe('Gemini OAuth and Code Assist', () => {
     expect(response.status).toBe(400)
     await service.dispose()
 
-    const secondClient = fakeClient(async () => ({ currentTier: { cloudaicompanionProject: 'project-id' } }))
+    const secondClient = fakeClient(async () => ({ currentTier: { id: 'free-tier' }, cloudaicompanionProject: 'project-id' }))
     const secondService = createGeminiService(context(), { dshHome, clientId: 'id', clientSecret: 'secret', createClient: () => secondClient })
     const secondLogin = await secondService.startGeminiLogin()
     const state = new URL(secondLogin.authUrl).searchParams.get('state')!
@@ -142,11 +142,61 @@ describe('Gemini OAuth and Code Assist', () => {
       calls += 1
       if (calls === 1) return { allowedTiers: [{ id: 'free-tier', isDefault: true }] }
       if (calls === 2) return { done: false, name: 'operations/test' }
-      return { done: true, response: { cloudaicompanionProject: 'project-id' } }
+      return { done: true, response: { cloudaicompanionProject: { id: 'project-id', name: 'Project' } } }
     })
     const service = createGeminiService(context(), { dshHome, clientId: 'id', clientSecret: 'secret', createClient: () => client })
     await expect(service.ensureGeminiCodeAssistSetup()).resolves.toEqual({ projectId: 'project-id' })
     expect(timer).toHaveBeenCalledWith(expect.any(Function), 5_000)
+  })
+
+  it('reports account validation before trying to select an onboarding tier', async () => {
+    const dshHome = await home()
+    await saveGeminiCredential({ refreshToken: 'refresh' }, dshHome)
+    const client = fakeClient(async () => ({ ineligibleTiers: [{ reasonCode: 'VALIDATION_REQUIRED', validationUrl: 'https://example.test/verify' }] }))
+    const service = createGeminiService(context(), { dshHome, clientId: 'id', clientSecret: 'secret', createClient: () => client })
+    await expect(service.ensureGeminiCodeAssistSetup()).rejects.toMatchObject({ code: 'GEMINI_VALIDATION_REQUIRED', message: 'Gemini Code Assist account validation is required' })
+    await service.dispose()
+  })
+
+  it('classifies every other non-empty ineligible tier list as account ineligible', async () => {
+    const dshHome = await home()
+    await saveGeminiCredential({ refreshToken: 'refresh' }, dshHome)
+    const client = fakeClient(async () => ({ ineligibleTiers: [{ reasonCode: 'RESTRICTED_NETWORK' }] }))
+    const service = createGeminiService(context(), { dshHome, clientId: 'id', clientSecret: 'secret', createClient: () => client })
+    await expect(service.ensureGeminiCodeAssistSetup()).rejects.toMatchObject({ code: 'GEMINI_ACCOUNT_NOT_ELIGIBLE', message: 'Gemini Code Assist account is not eligible' })
+    await service.dispose()
+  })
+
+  it('classifies Gaxios error response data instead of losing the upstream error code', async () => {
+    const dshHome = await home()
+    await saveGeminiCredential({ refreshToken: 'refresh' }, dshHome)
+    const client = fakeClient(async () => ({}))
+    vi.mocked(client.request).mockRejectedValueOnce({ response: { status: 403, data: { error: { message: 'account validation required' } } } })
+    const service = createGeminiService(context(), { dshHome, clientId: 'id', clientSecret: 'secret', createClient: () => client })
+    await expect(service.requestJson({ url: 'https://example.test', method: 'POST' })).rejects.toMatchObject({ code: 'GEMINI_VALIDATION_REQUIRED' })
+    await service.dispose()
+  })
+
+  it('advertises the supported static Gemini models', async () => {
+    const service = createGeminiService(context(), { clientId: 'id', clientSecret: 'secret', createClient: () => fakeClient(async () => ({})) })
+    const adapter = new (await import('../src/gemini.js')).GeminiCliAdapter(service)
+    await expect(adapter.listModels('gemini-cli-oauth')).resolves.toEqual([
+      { provider: 'gemini-cli-oauth', id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+      { provider: 'gemini-cli-oauth', id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+    ])
+    await service.dispose()
+  })
+
+  it('rejects unsupported reasoning and reasoning history before Gemini I/O', async () => {
+    const transport: GeminiTransport = {
+      getProjectId: vi.fn(),
+      getAccessToken: vi.fn(),
+      requestJson: vi.fn(),
+      requestStream: vi.fn(),
+    }
+    await expect(collect(streamGemini(transport, { provider: 'gemini-cli-oauth', model: 'gemini', messages: [], reasoningEffort: 'high' } as never))).rejects.toMatchObject({ code: 'UNSUPPORTED_REASONING_EFFORT' })
+    await expect(collect(streamGemini(transport, { provider: 'gemini-cli-oauth', model: 'gemini', messages: [{ content: [{ type: 'reasoning', text: 'private thought' }] }] } as never))).rejects.toMatchObject({ code: 'GEMINI_REASONING_HISTORY_UNSUPPORTED' })
+    expect(transport.getProjectId).toHaveBeenCalledTimes(1)
   })
 
   it('honors an already-aborted request', async () => {

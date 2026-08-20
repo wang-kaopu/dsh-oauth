@@ -10,7 +10,7 @@ export interface Config {
   codexRedirectPort?: number
 }
 
-export const name = '@deepseek-ai/dsh-oauth-bridge'
+export const name = '@wang-kaopu/dsh-oauth'
 export const inject = ['credentials', 'llm'] as const
 
 interface ControlDependencies {
