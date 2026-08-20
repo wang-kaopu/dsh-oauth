@@ -5,7 +5,7 @@ const PACKAGE_NAME = '@wang-kaopu/dsh-oauth'
 export default defineConfig({
   name: `${PACKAGE_NAME}/client`,
   entry: {
-    client: 'src/client.ts',
+    client: 'src/client.tsx',
   },
   outDir: 'lib',
   format: 'cjs',
@@ -22,6 +22,7 @@ export default defineConfig({
     'react-dom/client',
     '@deepseek-ai/cordis',
     '@deepseek-ai/dsh-client-ui-slots',
+    '@deepseek-ai/dsh-client-ui-primitives',
   ],
   outputOptions: {
     entryFileNames: 'client.js',

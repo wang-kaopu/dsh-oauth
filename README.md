@@ -21,6 +21,8 @@ npm test
 
 `npm run build` 先用 `tsc` 生成 Node 端产物和声明文件，再用根目录的 `tsdown.config.ts` 生成 DSH 所需的 `lib/client.js` factory bundle 及 sourcemap。仅构建浏览器端可使用 `npm run bundle`，开发时可使用 `npm run watch:client`。
 
+Settings 页面由 DSH 原生 UI primitives 提供 Button 和 Pill，文案接入 DSH locale，支持中文、英文以及 DSH 的 Light、Dark、System 主题。插件不附带 OAuth 页面 CSS。
+
 Gemini OAuth 使用 Google installed-app client。请通过环境变量提供 Google 为该客户端分配的凭据：
 
 ```sh

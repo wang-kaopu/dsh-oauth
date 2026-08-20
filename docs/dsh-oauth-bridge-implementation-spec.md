@@ -188,7 +188,8 @@ dsh-oauth-bridge/
     ├── storage.ts
     ├── codex.ts
     ├── gemini.ts
-    └── client.ts
+    ├── client.tsx
+    └── client-locales.ts
 ```
 
 不要增加：
@@ -2292,22 +2293,22 @@ POST 写操作要求
 
 ---
 
-# 60. client.ts
+# 60. client.tsx
 
-`client.ts` 导出 `inject = ['slots']` 和 `apply(ctx)`，通过 `settings.section` 注册 OAuth 面板。构建时将其编译为浏览器安全的 `window.__ModuleLoader__.load({ id, factory })` 客户端模块；`exports["./client"]` 指向该产物，DSH Web 会按 `dsh.client` 声明加载它。
+`client.tsx` 导出 `inject = ['slots', 'locale']` 和 `apply(ctx)`，通过 `settings.section` 注册 OAuth 面板。页面文案由 `client-locales.ts` 提供中文和英文，按钮与状态分别使用 DSH `Button` 和 `Pill`。页面只使用少量 `React.CSSProperties` 做布局，不附带 CSS 文件。构建时将其编译为浏览器安全的 `window.__ModuleLoader__.load({ id, factory })` 客户端模块；`exports["./client"]` 指向该产物，DSH Web 会按 `dsh.client` 声明加载它。
 
-第一版 UI：
+Settings UI：
 
 ```text
-OAuth Providers
+OAuth 登录 / OAuth Providers
 
 Codex
-● Connected
-[ Logout ]
+已连接 / Connected
+[ 退出登录 / Log out ]
 
 Gemini CLI
-○ Not connected
-[ Login with Google ]
+未连接 / Not connected
+[ 使用 Google 登录 / Login with Google ]
 ```
 
 或者：
@@ -2607,7 +2608,7 @@ client.request
 未登录：
 
 ```text
-DSH UI 显示 Codex disconnected
+DSH UI 显示 Codex 未连接（Not connected）
 ```
 
 点击：
@@ -3162,7 +3163,8 @@ src/index.ts
 src/storage.ts
 src/codex.ts
 src/gemini.ts
-src/client.ts
+src/client.tsx
+src/client-locales.ts
 
 tests/storage.test.ts
 tests/codex.test.ts
