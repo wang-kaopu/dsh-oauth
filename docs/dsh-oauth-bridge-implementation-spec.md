@@ -29,7 +29,7 @@
         只负责 OAuth                  OAuth + Code Assist
               │                                 │
               ▼                                 ▼
- DSH 内置 openai-codex Provider       自定义 GeminiCliAdapter
+ OAuth 状态驱动的 openai-codex route     OAuth 状态驱动的 GeminiCliAdapter route
               │                                 │
               ▼                                 ▼
      ChatGPT Codex backend        cloudcode-pa.googleapis.com
@@ -46,6 +46,7 @@ OAuth 登录
 → 保存 access_token / refresh_token
 → 自动刷新
 → 将 access_token 写入 DSH Credentials
+→ 通过 `ctx.settings.mutate()` 动态写入 `llm-pi-ai.providers.openai-codex`
 → DSH 内置 openai-codex Provider 完成模型请求
 ```
 
@@ -735,25 +736,21 @@ ctx.credentials.unset(CODEX_TOKEN_REF)
 `cordis.patch.yml`：
 
 ```yaml
-- id: llm-pi-ai
-  config:
-    providers:
-      openai-codex:
-        apiKeyEnv: DSH_OPENAI_CODEX_TOKEN
-
 - insert:
     - id: oauth-bridge
       name: "@YOUR_SCOPE/dsh-oauth-bridge"
 ```
 
-如果目标 DSH 的已有配置结构不同，以目标版本官方 `llm-pi-ai` schema 为准。
-
-原则不变：
+未认证时不声明 Codex profile。登录后由 route manager 写入并在登出时撤销：
 
 ```text
-openai-codex
-→ DSH_OPENAI_CODEX_TOKEN
+authenticated → set providers.openai-codex.apiKeyEnv
+logout        → unset providers.openai-codex
 ```
+
+`openai-codex` 仍由 DSH 内置 `llm-pi-ai` 提供，插件不注册自定义 Codex adapter。
+
+route manager 会持久化 ownership marker，并用 `settings` revision 保护写入：已有用户 profile 不会被覆盖；只有本插件创建且仍保持原始 profile 的 route 才会在 logout 时删除。用户在插件创建后修改过的 route 会被保留，并解除插件 ownership。
 
 ---
 
@@ -1445,13 +1442,13 @@ gemini-cli-oauth
 
 # 37. Gemini Adapter 注册
 
-`index.ts`：
+`index.ts` 中保留 adapter 实例，但只在 OAuth 成功后挂载 route：
 
 ```ts
-ctx.llm.registerAdapter(
-  ['gemini-cli-oauth'],
-  new GeminiCliAdapter(...)
-)
+const syncGeminiRoute = createGeminiRouteSync(ctx, new GeminiCliAdapter(gemini))
+// 未登录：不 registerAdapter
+// 登录：registerAdapter(['gemini-cli-oauth'], adapter)
+// 登出：registration.replace([])
 ```
 
 Codex 不注册自定义 adapter。
@@ -1460,9 +1457,7 @@ Codex 不注册自定义 adapter。
 
 # 38. Gemini listModels
 
-V0.1 可以先使用静态模型列表。
-
-不要为了动态发现模型实现大量额外逻辑。
+模型目录来自 Code Assist `retrieveUserQuota` 的 `buckets[].modelId`，不维护静态白名单：
 
 实现：
 
@@ -1475,20 +1470,16 @@ async listModels(provider: string) {
     return []
   }
 
-  return [
-    // 按当前确认可用模型维护
-  ]
+  const response = await requestJson({
+    url: getMethodUrl('retrieveUserQuota'),
+    method: 'POST',
+    body: JSON.stringify({ project }),
+  })
+  return uniqueNonEmptyModelIds(response.buckets)
 }
 ```
 
-V0.1 固定公布已经在测试请求中使用的模型 ID：
-
-```text
-gemini-2.5-pro
-gemini-2.5-flash
-```
-
-不做远程模型发现；模型目录是选择器提示，不构成请求白名单。
+结果按模型 ID 去重并过滤空值；缓存 5 分钟，登出、project 变化和认证失效时清空，并通过 generation 防止旧账号的 in-flight 请求污染新账号。远端临时失败或成功返回空目录时可复用最近一次成功结果，并通过 single-flight 避免并发重复请求。模型 ID 保持原值发送请求，只对显示名称做格式化。Gemini 请求明确返回 401 或 OAuth `invalid_grant` 时清除凭据并撤销 provider route；临时刷新失败不改变已登录状态。
 
 ---
 
@@ -2385,6 +2376,7 @@ child_process
 export const inject = [
   'credentials',
   'llm',
+  'settings',
 ]
 
 export function apply(
@@ -2403,15 +2395,9 @@ export function apply(
       config,
     )
 
-  ctx.llm.registerAdapter(
-    [
-      'gemini-cli-oauth',
-    ],
-
-    new GeminiCliAdapter(
-      gemini
-    )
-  )
+  const geminiAdapter = new GeminiCliAdapter(gemini)
+  const syncGeminiRoute = createGeminiRouteSync(ctx, geminiAdapter)
+  // initialize() 的认证状态回调负责首次注册、route replace 和撤销。
 
   // start control server
 

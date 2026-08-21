@@ -32,12 +32,14 @@ export const GEMINI_CLIENT_ID_ENV = 'GEMINI_CLIENT_ID'
 export const GEMINI_CLIENT_SECRET_ENV = 'GEMINI_CLIENT_SECRET'
 export const GEMINI_CLIENT_ID = process.env[GEMINI_CLIENT_ID_ENV] ?? ''
 export const GEMINI_CLIENT_SECRET = process.env[GEMINI_CLIENT_SECRET_ENV] ?? ''
+export const GEMINI_MODEL_CACHE_TTL_MS = 5 * 60_000
 
 export interface GeminiServiceConfig {
   dshHome?: string
   clientId?: string
   clientSecret?: string
   createClient?: (clientId: string, clientSecret: string) => OAuth2Client
+  onAuthStateChange?: (authenticated: boolean) => void | Promise<void>
 }
 
 interface GeminiLogin {
@@ -88,6 +90,18 @@ interface CodeAssistErrorResponse {
   error?: CodeAssistError
 }
 
+interface GeminiQuotaBucket {
+  modelId?: string
+  remainingAmount?: string
+  remainingFraction?: number
+  resetTime?: string
+  tokenType?: string
+}
+
+interface RetrieveUserQuotaResponse {
+  buckets?: GeminiQuotaBucket[]
+}
+
 interface GeminiRequestOptions {
   url: string
   method: 'GET' | 'POST'
@@ -108,6 +122,7 @@ export interface GeminiTransport {
   requestJson<T>(options: GeminiRequestOptions): Promise<T>
   requestStream(options: GeminiRequestOptions): Promise<AsyncIterable<Uint8Array | string>>
   getAccessToken(): Promise<string>
+  listModels(signal?: AbortSignal): Promise<readonly string[]>
 }
 
 /**
@@ -240,6 +255,14 @@ function errorResponse(error: unknown): { status?: number; data?: CodeAssistErro
   const response = (error as { response?: { status?: number; data?: unknown } }).response
   const data = typeof response?.data === 'object' && response.data !== null ? response.data as CodeAssistErrorResponse : undefined
   return { status: response?.status, data }
+}
+
+/** Identify OAuth failures that prove the stored Gemini refresh credential is unusable. */
+function isPermanentAuthFailure(error: unknown): boolean {
+  if ((error as { code?: string }).code === 'GEMINI_AUTH_REQUIRED') return true
+  const { status, data } = errorResponse(error)
+  if (status === 401) return true
+  return typeof (data as { error?: unknown } | undefined)?.error === 'string' && (data as { error: string }).error === 'invalid_grant'
 }
 
 function responseHtml(message: string): string {
@@ -383,6 +406,64 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
   let client: OAuth2Client | undefined
   let projectCache: string | undefined
   let pending: GeminiLogin | undefined
+  let modelCache: { models: readonly string[]; expiresAt: number } | undefined
+  let lastAuthState: boolean | undefined
+  let authStateRetryTimer: ReturnType<typeof setTimeout> | undefined
+  let modelRefresh: Promise<readonly string[]> | undefined
+  let modelGeneration = 0
+
+  /** Cancel the one-shot retry for a failed route synchronization. */
+  function clearAuthStateRetry(): void {
+    if (authStateRetryTimer === undefined) return
+    clearTimeout(authStateRetryTimer)
+    authStateRetryTimer = undefined
+  }
+
+  /** Retry one failed route synchronization without changing the completed OAuth transaction. */
+  function scheduleAuthStateRetry(authenticated: boolean): void {
+    clearAuthStateRetry()
+    authStateRetryTimer = setTimeout(() => {
+      authStateRetryTimer = undefined
+      if (lastAuthState !== authenticated) return
+      void (async () => {
+        try {
+          await config.onAuthStateChange?.(authenticated)
+        } catch (error) {
+          ctx.logger.warn(`OAuth route sync retry failed (${error instanceof Error ? error.message : String(error)})`)
+        }
+      })()
+    }, 1_000)
+    authStateRetryTimer.unref?.()
+  }
+
+  /** Publish an authentication transition without allowing route failures to fail OAuth. */
+  async function publishAuthState(authenticated: boolean): Promise<void> {
+    if (authenticated === lastAuthState) return
+    lastAuthState = authenticated
+    clearAuthStateRetry()
+    try {
+      await config.onAuthStateChange?.(authenticated)
+    } catch (error) {
+      ctx.logger.warn(`OAuth route sync failed (${error instanceof Error ? error.message : String(error)})`)
+      scheduleAuthStateRetry(authenticated)
+    }
+  }
+
+  /** Invalidate cached model discovery and any in-flight result from the previous auth session. */
+  function invalidateModelDiscovery(): void {
+    modelGeneration += 1
+    modelCache = undefined
+    modelRefresh = undefined
+  }
+
+  /** Revoke persisted Gemini authentication after a confirmed permanent auth failure. */
+  async function revokeAuthentication(): Promise<void> {
+    invalidateModelDiscovery()
+    await clearGeminiCredential(config.dshHome)
+    client = undefined
+    projectCache = undefined
+    await publishAuthState(false)
+  }
 
   async function persistTokens(tokens: Credentials): Promise<void> {
     const old = await loadGeminiCredential(config.dshHome)
@@ -417,45 +498,63 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
   }
 
   async function getAccessToken(): Promise<string> {
-    const oauthClient = await getClient()
     try {
+      const oauthClient = await getClient()
       const result = await oauthClient.getAccessToken()
       if (!result.token) throw geminiError('Gemini OAuth did not return an access token', 'GEMINI_AUTH_REQUIRED')
       return result.token
     } catch (error) {
-      if ((error as { code?: string }).code?.startsWith('GEMINI_')) throw error
-      throw geminiError('Gemini OAuth token refresh failed', 'GEMINI_AUTH_REQUIRED', error)
+      if (isPermanentAuthFailure(error)) {
+        await revokeAuthentication()
+        if ((error as { code?: string }).code === 'GEMINI_AUTH_REQUIRED') throw error
+        throw geminiError('Gemini authentication is required', 'GEMINI_AUTH_REQUIRED', error, errorResponse(error).status)
+      }
+      throw geminiError('Gemini OAuth token refresh failed', 'GEMINI_REFRESH_FAILED', error)
     }
   }
 
   async function requestJson<T>(options: GeminiRequestOptions): Promise<T> {
-    const oauthClient = await getClient()
     try {
+      const oauthClient = await getClient()
       const response = await oauthClient.request<T>({ ...options, headers: { ...(options.headers ?? {}), 'content-type': options.headers?.['content-type'] ?? 'application/json' } }) as unknown as GeminiRequestResponse<T>
       if (response.status !== undefined && response.status >= 400) {
         const data = response.data as unknown as CodeAssistErrorResponse
-        throw geminiError('Gemini Code Assist request failed', errorCodeFromResponse(data.error, 'GEMINI_HTTP_ERROR'), undefined, response.status)
+        throw geminiError('Gemini Code Assist request failed', response.status === 401 ? 'GEMINI_AUTH_REQUIRED' : errorCodeFromResponse(data.error, 'GEMINI_HTTP_ERROR'), undefined, response.status)
       }
       return response.data
     } catch (error) {
-      if ((error as { code?: string }).code?.startsWith('GEMINI_')) throw error
+      if ((error as { code?: string }).code?.startsWith('GEMINI_')) {
+        if ((error as { code?: string }).code === 'GEMINI_AUTH_REQUIRED') await revokeAuthentication()
+        throw error
+      }
       const { status, data } = errorResponse(error)
-      const code = status === 401 ? 'GEMINI_AUTH_REQUIRED' : errorCodeFromResponse(data?.error, 'GEMINI_HTTP_ERROR')
-      throw geminiError(status === 401 ? 'Gemini authentication is required' : 'Gemini Code Assist request failed', code, error, status)
+      if (isPermanentAuthFailure(error)) {
+        await revokeAuthentication()
+        throw geminiError('Gemini authentication is required', 'GEMINI_AUTH_REQUIRED', error, status)
+      }
+      throw geminiError('Gemini Code Assist request failed', errorCodeFromResponse(data?.error, 'GEMINI_HTTP_ERROR'), error, status)
     }
   }
 
   async function requestStream(options: GeminiRequestOptions): Promise<AsyncIterable<Uint8Array | string>> {
-    const oauthClient = await getClient()
     try {
+      const oauthClient = await getClient()
       const response = await oauthClient.request<unknown>({ ...options, responseType: 'stream', headers: { ...(options.headers ?? {}), 'content-type': options.headers?.['content-type'] ?? 'application/json' } }) as unknown as GeminiRequestResponse<AsyncIterable<Uint8Array | string>>
-      if (response.status !== undefined && response.status >= 400) throw geminiError('Gemini stream request failed', response.status === 401 ? 'GEMINI_AUTH_REQUIRED' : 'GEMINI_HTTP_ERROR', undefined, response.status)
+      if (response.status !== undefined && response.status >= 400) {
+        throw geminiError('Gemini stream request failed', response.status === 401 ? 'GEMINI_AUTH_REQUIRED' : 'GEMINI_HTTP_ERROR', undefined, response.status)
+      }
       return response.data
     } catch (error) {
-      if ((error as { code?: string }).code?.startsWith('GEMINI_')) throw error
+      if ((error as { code?: string }).code?.startsWith('GEMINI_')) {
+        if ((error as { code?: string }).code === 'GEMINI_AUTH_REQUIRED') await revokeAuthentication()
+        throw error
+      }
       const { status, data } = errorResponse(error)
-      const code = status === 401 ? 'GEMINI_AUTH_REQUIRED' : errorCodeFromResponse(data?.error, 'GEMINI_HTTP_ERROR')
-      throw geminiError(status === 401 ? 'Gemini authentication is required' : 'Gemini stream request failed', code, error, status)
+      if (isPermanentAuthFailure(error)) {
+        await revokeAuthentication()
+        throw geminiError('Gemini authentication is required', 'GEMINI_AUTH_REQUIRED', error, status)
+      }
+      throw geminiError('Gemini stream request failed', errorCodeFromResponse(data?.error, 'GEMINI_HTTP_ERROR'), error, status)
     }
   }
 
@@ -500,6 +599,7 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
     }
     if (!resolvedProject) throw geminiError('Gemini Code Assist did not return a project ID', 'GEMINI_PROJECT_REQUIRED')
     if (projectIdIsNumeric(resolvedProject)) throw geminiError('Gemini Code Assist returned a project number instead of a project ID', 'GEMINI_INVALID_PROJECT_ID')
+    if (projectCache !== undefined && projectCache !== resolvedProject) invalidateModelDiscovery()
     projectCache = resolvedProject
     const latest = await loadGeminiCredential(config.dshHome)
     if (latest) await saveGeminiCredential({ ...latest, projectId: resolvedProject }, config.dshHome)
@@ -510,6 +610,53 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
   async function getProjectId(signal?: AbortSignal): Promise<string> {
     if (projectCache) return projectCache
     return (await ensureGeminiCodeAssistSetup(undefined, signal)).projectId
+  }
+
+  /** Discover the account's current Code Assist model buckets with a short-lived last-known-good cache. */
+  async function listModels(signal?: AbortSignal): Promise<readonly string[]> {
+    if (modelCache && modelCache.expiresAt > Date.now()) return modelCache.models
+    if (modelRefresh) return modelRefresh
+    const generation = modelGeneration
+    if (!(await isAuthenticated())) return []
+    if (generation !== modelGeneration) return []
+    if (modelRefresh) return modelRefresh
+    const previous = modelCache
+    const refresh = (async (): Promise<readonly string[]> => {
+      try {
+        const project = await getProjectId(signal)
+        const response = await requestJson<RetrieveUserQuotaResponse>({
+          url: getMethodUrl('retrieveUserQuota'),
+          method: 'POST',
+          headers: attributionHeaders(),
+          body: JSON.stringify({ project }),
+          signal,
+        })
+        if (generation !== modelGeneration) return []
+        const models = [...new Set((response.buckets ?? [])
+          .map(bucket => bucket.modelId?.trim())
+          .filter((model): model is string => Boolean(model)))]
+        if (models.length === 0 && previous?.models.length) {
+          ctx.logger.warn('Gemini model discovery returned no model IDs; using cached models')
+          return previous.models
+        }
+        modelCache = { models, expiresAt: Date.now() + GEMINI_MODEL_CACHE_TTL_MS }
+        return models
+      } catch (error) {
+        if (generation !== modelGeneration) return []
+        if ((error as { code?: string }).code === 'GEMINI_AUTH_REQUIRED') throw error
+        if (previous) {
+          ctx.logger.warn('Gemini model refresh failed; using cached models')
+          return previous.models
+        }
+        throw error
+      }
+    })()
+    modelRefresh = refresh
+    try {
+      return await refresh
+    } finally {
+      if (modelRefresh === refresh) modelRefresh = undefined
+    }
   }
 
   async function handleCallback(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -537,7 +684,9 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
         ...(tokens.expiry_date == null ? {} : { expiresAt: tokens.expiry_date }),
       }, config.dshHome)
       client = login.client
+      invalidateModelDiscovery()
       await ensureGeminiCodeAssistSetup(login.client)
+      await publishAuthState(true)
       ctx.logger.info('Gemini login succeeded')
       sendResponse(response, 200, 'Gemini login succeeded')
     } catch (error) {
@@ -581,12 +730,18 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
   }
 
   async function initialize(): Promise<void> {
-    if (await isAuthenticated()) {
-      try {
-        await getClient()
-      } catch {
-        ctx.logger.warn('Gemini authentication could not be restored')
+    if (!(await isAuthenticated())) {
+      await publishAuthState(false)
+      return
+    }
+    try {
+      await getClient()
+      await publishAuthState(true)
+    } catch (error) {
+      if (isPermanentAuthFailure(error)) {
+        await revokeAuthentication()
       }
+      throw error
     }
   }
 
@@ -595,19 +750,23 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
   }
 
   async function logout(): Promise<void> {
+    invalidateModelDiscovery()
     await clearGeminiCredential(config.dshHome)
     client = undefined
     projectCache = undefined
+    await publishAuthState(false)
   }
 
   async function dispose(): Promise<void> {
+    clearAuthStateRetry()
     if (pending) await closeServer(pending.server)
     pending = undefined
     client = undefined
     projectCache = undefined
+    invalidateModelDiscovery()
   }
 
-  return { getProjectId, requestJson, requestStream, getAccessToken, startGeminiLogin, initialize, logout, dispose, isAuthenticated, ensureGeminiCodeAssistSetup }
+  return { getProjectId, requestJson, requestStream, getAccessToken, listModels, startGeminiLogin, initialize, logout, dispose, isAuthenticated, ensureGeminiCodeAssistSetup }
 }
 
 /**
@@ -676,6 +835,12 @@ export async function* streamGemini(transport: GeminiTransport, options: Generat
   yield { type: 'finish', reason: { kind: hasToolCall ? 'tool-calls' : 'stop' } }
 }
 
+/** Convert a remote Gemini model ID into a readable selector label without changing the request ID. */
+function formatGeminiModelName(id: string): string {
+  const clean = id.replace(/^models\//, '')
+  return clean.split('-').map(part => part.length === 0 ? part : part[0]!.toUpperCase() + part.slice(1)).join(' ')
+}
+
 /**
  * DSH adapter for the Gemini CLI Code Assist route.
  */
@@ -712,9 +877,7 @@ export class GeminiCliAdapter extends LlmAdapter {
    */
   async listModels(provider: string): Promise<readonly { provider: string; id: string; name: string }[]> {
     if (provider !== 'gemini-cli-oauth') return []
-    return [
-      { provider, id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
-      { provider, id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
-    ]
+    const models = await this.transport.listModels()
+    return models.map(id => ({ provider, id, name: formatGeminiModelName(id) }))
   }
 }

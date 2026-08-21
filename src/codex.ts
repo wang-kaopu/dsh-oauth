@@ -30,6 +30,7 @@ const CODEX_SCOPE = [
 export interface CodexServiceConfig {
   dshHome?: string
   codexRedirectPort?: number
+  onAuthStateChange?: (authenticated: boolean) => void | Promise<void>
 }
 
 interface PendingLogin {
@@ -210,6 +211,45 @@ export function createCodexService(ctx: Context, config: CodexServiceConfig = {}
   let pending: PendingLogin | undefined
   let refreshTimer: ReturnType<typeof setTimeout> | undefined
   let credentialMutation: Promise<void> = Promise.resolve()
+  let lastAuthState: boolean | undefined
+  let authStateRetryTimer: ReturnType<typeof setTimeout> | undefined
+
+  /** Cancel the one-shot retry for a failed route synchronization. */
+  function clearAuthStateRetry(): void {
+    if (authStateRetryTimer === undefined) return
+    clearTimeout(authStateRetryTimer)
+    authStateRetryTimer = undefined
+  }
+
+  /** Retry one failed route synchronization without changing the completed OAuth transaction. */
+  function scheduleAuthStateRetry(authenticated: boolean): void {
+    clearAuthStateRetry()
+    authStateRetryTimer = setTimeout(() => {
+      authStateRetryTimer = undefined
+      if (lastAuthState !== authenticated) return
+      void (async () => {
+        try {
+          await config.onAuthStateChange?.(authenticated)
+        } catch (error) {
+          ctx.logger.warn(`OAuth route sync retry failed (${error instanceof Error ? error.message : String(error)})`)
+        }
+      })()
+    }, 1_000)
+    authStateRetryTimer.unref?.()
+  }
+
+  /** Publish an authentication transition without allowing route failures to fail OAuth. */
+  async function publishAuthState(authenticated: boolean): Promise<void> {
+    if (authenticated === lastAuthState) return
+    lastAuthState = authenticated
+    clearAuthStateRetry()
+    try {
+      await config.onAuthStateChange?.(authenticated)
+    } catch (error) {
+      ctx.logger.warn(`OAuth route sync failed (${error instanceof Error ? error.message : String(error)})`)
+      scheduleAuthStateRetry(authenticated)
+    }
+  }
 
   async function setDshCredential(accessToken: string): Promise<void> {
     await ctx.credentials.set(CODEX_TOKEN_REF, accessToken)
@@ -261,10 +301,14 @@ export function createCodexService(ctx: Context, config: CodexServiceConfig = {}
   async function getCodexAccessToken(): Promise<string> {
     return enqueueCredentialMutation(async () => {
       const stored = await loadCodexCredential(config.dshHome)
-      if (!stored) throw errorWithCode('Codex authentication is required', 'CODEX_AUTH_REQUIRED')
+      if (!stored) {
+        await publishAuthState(false)
+        throw errorWithCode('Codex authentication is required', 'CODEX_AUTH_REQUIRED')
+      }
       if (stored.expiresAt > Date.now() + 60_000) {
         await setDshCredential(stored.accessToken)
         scheduleRefresh(stored.expiresAt)
+        await publishAuthState(true)
         return stored.accessToken
       }
       try {
@@ -272,12 +316,14 @@ export function createCodexService(ctx: Context, config: CodexServiceConfig = {}
         await saveCodexCredential(refreshed, config.dshHome)
         await setDshCredential(refreshed.accessToken)
         scheduleRefresh(refreshed.expiresAt)
+        await publishAuthState(true)
         ctx.logger.info('Codex token refreshed')
         return refreshed.accessToken
       } catch (error) {
         if ((error as { code?: string }).code === 'CODEX_AUTH_REQUIRED') {
           await clearCodexCredential(config.dshHome)
           await ctx.credentials.unset(CODEX_TOKEN_REF)
+          await publishAuthState(false)
           throw error
         }
         throw error
@@ -308,6 +354,7 @@ export function createCodexService(ctx: Context, config: CodexServiceConfig = {}
         await saveCodexCredential(credential, config.dshHome)
         await setDshCredential(credential.accessToken)
         scheduleRefresh(credential.expiresAt)
+        await publishAuthState(true)
         ctx.logger.info('Codex login succeeded')
       })
       sendResponse(response, 200, 'Codex login succeeded')
@@ -350,7 +397,10 @@ export function createCodexService(ctx: Context, config: CodexServiceConfig = {}
 
   async function initialize(): Promise<void> {
     const stored = await loadCodexCredential(config.dshHome)
-    if (!stored) return
+    if (!stored) {
+      await publishAuthState(false)
+      return
+    }
     try {
       await getCodexAccessToken()
     } catch (error) {
@@ -369,11 +419,13 @@ export function createCodexService(ctx: Context, config: CodexServiceConfig = {}
       clearRefreshTimer()
       await clearCodexCredential(config.dshHome)
       await ctx.credentials.unset(CODEX_TOKEN_REF)
+      await publishAuthState(false)
     })
   }
 
   async function dispose(): Promise<void> {
     clearRefreshTimer()
+    clearAuthStateRetry()
     if (pending) await closeServer(pending.server)
     pending = undefined
     await credentialMutation

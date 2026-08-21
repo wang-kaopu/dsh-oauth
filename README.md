@@ -53,6 +53,6 @@ npm run watch:client
 
 - Gemini 非 FREE tier 需要设置 `GOOGLE_CLOUD_PROJECT` 或 `GOOGLE_CLOUD_PROJECT_ID`。
 - 插件当前只支持单账号；Gemini callback 端口由操作系统动态分配。
-- Gemini 模型目录采用静态配置，默认提供 `gemini-2.5-pro` 和 `gemini-2.5-flash`，不做远程发现。
+- Codex 与 Gemini provider route 由 OAuth 认证状态动态挂载和撤销；Gemini 模型目录来自 Code Assist `retrieveUserQuota`，缓存 5 分钟，并在远端失败或返回空目录时复用最近一次成功结果。明确的 Gemini 401 或 OAuth `invalid_grant` 会清除凭据并撤销 provider route，临时刷新失败则保留已登录状态。
 - 暂不支持 reasoning effort、额度、代理、Web Search、图像生成和 token revoke endpoint。
-- OAuth 令牌保存在 `$DSH_HOME/oauth-bridge.json`，文件权限为 `0600`。本地 control server 只监听 `127.0.0.1:1456`。
+- OAuth 令牌及 Codex route ownership 元数据保存在 `$DSH_HOME/oauth-bridge.json`，文件权限为 `0600`。本地 control server 只监听 `127.0.0.1:1456`。

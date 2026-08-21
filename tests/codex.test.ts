@@ -48,7 +48,23 @@ describe('Codex OAuth', () => {
     expect(decodeJwtPayload(token)).toMatchObject({ 'https://api.openai.com/auth': { chatgpt_account_id: 'account-1' } })
   })
 
-  it('exchanges an authorization code and stores the credential', async () => {
+  it('publishes authentication state through startup, logout, and refresh recovery', async () => {
+    const dshHome = await home()
+    const ctx = context()
+    const states: boolean[] = []
+    const service = createCodexService(ctx as never, { dshHome, onAuthStateChange: state => void states.push(state) })
+    await service.initialize()
+    expect(states).toEqual([false])
+
+    await saveCodexCredential({ accessToken: 'access', refreshToken: 'refresh', expiresAt: Date.now() + 3_600_000, accountId: 'account' }, dshHome)
+    await service.initialize()
+    expect(states).toEqual([false, true])
+    await service.logout()
+    expect(states).toEqual([false, true, false])
+    await service.dispose()
+  })
+
+  it('keeps OAuth successful when route synchronization fails', async () => {
     const dshHome = await home()
     const ctx = context()
     const originalFetch = globalThis.fetch
@@ -57,13 +73,28 @@ describe('Codex OAuth', () => {
       if (String(input) === CODEX_TOKEN_URL) return new Response(JSON.stringify({ access_token: accessToken, refresh_token: 'refresh', expires_in: 3600 }))
       return originalFetch(input)
     }))
-    const service = createCodexService(ctx as never, { dshHome, codexRedirectPort: 0 })
+    const service = createCodexService(ctx as never, { dshHome, codexRedirectPort: 0, onAuthStateChange: async () => { throw new Error('settings unavailable') } })
     const { authUrl } = await service.startCodexLogin()
     const callbackPort = new URL(authUrl).searchParams.get('redirect_uri')!.match(/:(\d+)\//)![1]
     const state = new URL(authUrl).searchParams.get('state')!
-    await originalFetch(`http://127.0.0.1:${callbackPort}/auth/callback?code=test-code&state=${encodeURIComponent(state)}`)
+    const callback = await originalFetch(`http://127.0.0.1:${callbackPort}/auth/callback?code=test-code&state=${encodeURIComponent(state)}`)
+    expect(callback.status).toBe(200)
     expect(await loadCodexCredential(dshHome)).toMatchObject({ accessToken, refreshToken: 'refresh', accountId: 'account-1' })
     expect(ctx.values.get('DSH_OPENAI_CODEX_TOKEN')).toBe(accessToken)
+    await service.dispose()
+  })
+
+  it('contains synchronous route retry failures', async () => {
+    vi.useFakeTimers()
+    const dshHome = await home()
+    await saveCodexCredential({ accessToken: 'access', refreshToken: 'refresh', expiresAt: Date.now() + 3_600_000, accountId: 'account' }, dshHome)
+    const callback = vi.fn(() => { throw new Error('settings conflict') })
+    const service = createCodexService(context() as never, { dshHome, onAuthStateChange: callback })
+
+    await service.initialize()
+    expect(callback).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(callback).toHaveBeenCalledTimes(2)
     await service.dispose()
   })
 
@@ -81,9 +112,10 @@ describe('Codex OAuth', () => {
   it('refreshes expired tokens and clears permanently invalid credentials', async () => {
     const dshHome = await home()
     const ctx = context()
+    const states: boolean[] = []
     await saveCodexCredential({ accessToken: 'old', refreshToken: 'old-refresh', expiresAt: 0, accountId: 'account' }, dshHome)
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ access_token: 'new', expires_in: 3600 }), { status: 200 })))
-    const service = createCodexService(ctx as never, { dshHome })
+    const service = createCodexService(ctx as never, { dshHome, onAuthStateChange: state => void states.push(state) })
     expect(await service.getCodexAccessToken()).toBe('new')
     expect((await loadCodexCredential(dshHome))?.refreshToken).toBe('old-refresh')
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'refresh_token_expired' }), { status: 400 })))
@@ -91,6 +123,7 @@ describe('Codex OAuth', () => {
     await expect(service.getCodexAccessToken()).rejects.toMatchObject({ code: 'CODEX_AUTH_REQUIRED' })
     expect(await loadCodexCredential(dshHome)).toBeUndefined()
     expect(ctx.credentials.unset).toHaveBeenCalled()
+    expect(states).toEqual([true, false])
     await service.dispose()
   })
 

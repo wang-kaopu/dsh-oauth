@@ -9,6 +9,7 @@ import {
   loadGeminiCredential,
   saveCodexCredential,
   saveGeminiCredential,
+  setCodexRouteOwnership,
   type CodexCredential,
 } from '../src/storage.js'
 
@@ -48,6 +49,19 @@ describe('storage', () => {
     expect((await loadDocument(home)).codex).toBeUndefined()
     await clearGeminiCredential(home)
     expect(await loadDocument(home)).toEqual({ version: 1 })
+  })
+
+  it('preserves Codex route ownership while clearing credentials', async () => {
+    const home = await testHome()
+    await saveCodexCredential(codex, home)
+    await saveGeminiCredential({ refreshToken: 'refresh' }, home)
+    await setCodexRouteOwnership(true, home)
+
+    await clearCodexCredential(home)
+    expect(await loadDocument(home)).toEqual({ version: 1, codexRouteOwned: true, gemini: { refreshToken: 'refresh' } })
+
+    await clearGeminiCredential(home)
+    expect(await loadDocument(home)).toEqual({ version: 1, codexRouteOwned: true })
   })
 
   it('reports malformed JSON explicitly', async () => {

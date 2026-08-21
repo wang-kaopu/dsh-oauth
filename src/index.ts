@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { loadCodexCredential } from './storage.js'
 import { createCodexService } from './codex.js'
 import { createGeminiService, GeminiCliAdapter } from './gemini.js'
+import { createCodexRouteSync, createGeminiRouteSync } from './routes.js'
 import { createServer, type Server } from 'node:http'
 
 export interface Config {
@@ -11,7 +12,7 @@ export interface Config {
 }
 
 export const name = '@kelvinwww/dsh-oauth'
-export const inject = ['credentials', 'llm'] as const
+export const inject = ['credentials', 'llm', 'settings'] as const
 
 interface ControlDependencies {
   codex: {
@@ -123,9 +124,12 @@ export async function createControlServer(dependencies: ControlDependencies): Pr
  * @param config - small plugin configuration surface.
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const codex = createCodexService(ctx, config)
-  const gemini = createGeminiService(ctx, config)
-  ctx.llm.registerAdapter(['gemini-cli-oauth'], new GeminiCliAdapter(gemini))
+  const syncCodexRoute = createCodexRouteSync(ctx, config.dshHome)
+  let syncGeminiRoute: (authenticated: boolean) => void
+  const codex = createCodexService(ctx, { ...config, onAuthStateChange: syncCodexRoute })
+  const gemini = createGeminiService(ctx, { ...config, onAuthStateChange: authenticated => syncGeminiRoute(authenticated) })
+  const geminiAdapter = new GeminiCliAdapter(gemini)
+  syncGeminiRoute = createGeminiRouteSync(ctx, geminiAdapter)
   void codex.initialize().catch(error => ctx.logger.warn(`Codex startup failed (${(error as { code?: string }).code ?? 'unknown'})`))
   void gemini.initialize().catch(error => ctx.logger.warn(`Gemini startup failed (${(error as { code?: string }).code ?? 'unknown'})`))
   const control = createControlServer({ codex, gemini, dshHome: config.dshHome, port: config.controlPort ?? 1456 })
