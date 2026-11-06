@@ -23,6 +23,12 @@ export const en = {
   unavailable:
     'OAuth control server is unavailable.',
 
+  popupBlocked:
+    'The authorization page did not open automatically.',
+
+  openAuthUrl:
+    'Open it manually',
+
   operationFailed:
     'OAuth operation failed.',
 } as const
@@ -55,6 +61,12 @@ export const zh:
 
   unavailable:
     'OAuth 控制服务不可用。',
+
+  popupBlocked:
+    '授权页没有自动打开。',
+
+  openAuthUrl:
+    '手动打开',
 
   operationFailed:
     'OAuth 操作失败。',

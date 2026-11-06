@@ -1,12 +1,13 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { AdapterRegistrationHandle, LlmAdapter } from '@deepseek-ai/dsh-llm'
+import type {} from '@deepseek-ai/dsh-settings'
 import { loadCodexRouteOwnership, setCodexRouteOwnership } from './storage.js'
 
 export const CODEX_PROVIDER = 'openai-codex'
 export const GEMINI_PROVIDER = 'gemini-cli-oauth'
 
-const PI_AI_NS = settingsNamespace('llm-pi-ai')
+/** dsh 0.2.x settings entry id of the pi-ai provider registry (`llm-pi-ai`). */
+const PI_AI_NS = 'llm-pi-ai'
 const CODEX_PROFILE = { apiKeyEnv: 'DSH_OPENAI_CODEX_TOKEN' } as const
 
 interface CodexSettingsSnapshot {

@@ -2,11 +2,12 @@ import { OAuth2Client, type Credentials } from 'google-auth-library'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import {
   attributionHeaders,
-  CallId,
   LlmAdapter,
   LlmError,
+  ToolCallId,
   type GenerateOptions,
   type Message,
+  type RequestMessage,
   type StreamChunk,
   type ToolSchema,
 } from '@deepseek-ai/dsh-llm'
@@ -38,6 +39,8 @@ export interface GeminiServiceConfig {
   dshHome?: string
   clientId?: string
   clientSecret?: string
+  /** Optional Google Cloud project id (paid tiers); falls back to GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_PROJECT_ID. */
+  projectId?: string
   createClient?: (clientId: string, clientSecret: string) => OAuth2Client
   onAuthStateChange?: (authenticated: boolean) => void | Promise<void>
 }
@@ -230,8 +233,8 @@ function projectIdIsNumeric(projectId: string): boolean {
   return /^\d+$/.test(projectId)
 }
 
-function selectedProjectId(stored: GeminiCredential | undefined): string | undefined {
-  const value = process.env.GOOGLE_CLOUD_PROJECT ?? process.env.GOOGLE_CLOUD_PROJECT_ID ?? stored?.projectId
+function selectedProjectId(stored: GeminiCredential | undefined, configured?: string): string | undefined {
+  const value = configured ?? process.env.GOOGLE_CLOUD_PROJECT ?? process.env.GOOGLE_CLOUD_PROJECT_ID ?? stored?.projectId
   if (value !== undefined && projectIdIsNumeric(value)) throw geminiError('A Google Cloud project number cannot be used as a project ID', 'GEMINI_INVALID_PROJECT_ID')
   return value
 }
@@ -240,6 +243,7 @@ function errorCodeFromResponse(error: CodeAssistError | undefined, fallback: str
   const value = `${error?.status ?? ''} ${error?.message ?? ''}`.toUpperCase()
   if (value.includes('VALIDATION')) return 'GEMINI_VALIDATION_REQUIRED'
   if (value.includes('ELIGIBLE')) return 'GEMINI_ACCOUNT_NOT_ELIGIBLE'
+  if (value.includes('SERVICE_DISABLED') || value.includes('ACCESSNOTCONFIGURED') || value.includes('HAS NOT BEEN USED')) return 'GEMINI_SERVICE_DISABLED'
   return fallback
 }
 
@@ -317,30 +321,42 @@ function contentParts(message: Message, toolNames: ReadonlyMap<string, string>):
       parts.push({ functionCall: { name: block.name, args } })
       continue
     }
-    if (block.type === 'tool-result') {
-      const response: Record<string, unknown> = {}
-      for (const result of block.content) {
-        if (result.type === 'text') response.output = `${response.output ?? ''}${result.text}`
-      }
-      if (block.isError) response.error = true
-      parts.push({ functionResponse: { name: toolNames.get(block.toolCallId) ?? block.toolCallId, response } })
-      continue
-    }
+    if (block.type === 'tool-addition' || block.type === 'tool-removal') continue
     throw geminiError(`Gemini does not support DSH content block ${block.type}`, 'GEMINI_STREAM_ERROR')
   }
   return parts
 }
 
-function convertContents(messages: Message[]): Record<string, unknown>[] {
+/**
+ * Convert dsh 0.2.x role-based messages into Gemini Code Assist contents.
+ * Tool results arrive as first-class `tool`-role messages; the mapping sends
+ * their `functionResponse` parts inside a `user`-role turn, which is the
+ * shape Gemini Code Assist expects. System-role messages are collected
+ * separately into the request-level system instruction.
+ */
+function convertContents(messages: RequestMessage[]): Record<string, unknown>[] {
   const toolNames = new Map<string, string>()
-  return messages.map(message => {
+  for (const message of messages) {
     for (const block of message.content) {
       if (block.type === 'tool-call') toolNames.set(block.id, block.name)
     }
-    return {
-      role: message.role === 'assistant' ? 'model' : 'user',
-      parts: contentParts(message, toolNames),
+  }
+  return messages.map(message => {
+    if (message.role === 'assistant') {
+      return { role: 'model', parts: contentParts(message, toolNames) }
     }
+    if (message.role === 'tool') {
+      const response: Record<string, unknown> = {}
+      for (const block of message.content) {
+        if (block.type === 'text') response.output = `${response.output ?? ''}${block.text}`
+      }
+      if (message.isError) response.error = true
+      return {
+        role: 'user',
+        parts: [{ functionResponse: { name: toolNames.get(message.toolCallId) ?? message.toolCallId, response } }],
+      }
+    }
+    return { role: 'user', parts: contentParts(message as Message, toolNames) }
   })
 }
 
@@ -355,13 +371,27 @@ function toGenerateRequest(options: GenerateOptions, project: string): Record<st
     ...(options.maxTokens === undefined ? {} : { maxOutputTokens: options.maxTokens }),
     ...(options.stop === undefined ? {} : { stopSequences: options.stop }),
   }
+  const systemTexts: string[] = []
+  const messages: RequestMessage[] = []
+  for (const message of options.messages) {
+    if (message.role === 'system') {
+      for (const block of message.content) {
+        if (block.type === 'text') systemTexts.push(block.text)
+      }
+      continue
+    }
+    messages.push(message)
+  }
+  const system = options.system === undefined
+    ? systemTexts.join('\n\n')
+    : [options.system, ...systemTexts].join('\n\n')
   return {
     model: options.model,
     project,
     ...(options.sessionId === undefined ? {} : { user_prompt_id: String(options.sessionId) }),
     request: {
-      contents: convertContents(options.messages),
-      ...(options.system === undefined ? {} : { systemInstruction: { parts: [{ text: options.system }] } }),
+      contents: convertContents(messages),
+      ...(system.length === 0 ? {} : { systemInstruction: { parts: [{ text: system }] } }),
       ...(convertTools(options.tools) === undefined ? {} : { tools: convertTools(options.tools) }),
       ...(Object.keys(generationConfig).length === 0 ? {} : { generationConfig }),
       ...(options.sessionId === undefined ? {} : { session_id: String(options.sessionId) }),
@@ -523,8 +553,9 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
       }
       return response.data
     } catch (error) {
-      if ((error as { code?: string }).code?.startsWith('GEMINI_')) {
-        if ((error as { code?: string }).code === 'GEMINI_AUTH_REQUIRED') await revokeAuthentication()
+      const thrown = (error as { code?: unknown }).code
+      if (typeof thrown === 'string' && thrown.startsWith('GEMINI_')) {
+        if (thrown === 'GEMINI_AUTH_REQUIRED') await revokeAuthentication()
         throw error
       }
       const { status, data } = errorResponse(error)
@@ -545,8 +576,9 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
       }
       return response.data
     } catch (error) {
-      if ((error as { code?: string }).code?.startsWith('GEMINI_')) {
-        if ((error as { code?: string }).code === 'GEMINI_AUTH_REQUIRED') await revokeAuthentication()
+      const thrown = (error as { code?: unknown }).code
+      if (typeof thrown === 'string' && thrown.startsWith('GEMINI_')) {
+        if (thrown === 'GEMINI_AUTH_REQUIRED') await revokeAuthentication()
         throw error
       }
       const { status, data } = errorResponse(error)
@@ -562,7 +594,7 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
     const activeClient = oauthClient ?? await getClient()
     client ??= activeClient
     const stored = await loadGeminiCredential(config.dshHome)
-    const localProjectId = selectedProjectId(stored)
+    const localProjectId = selectedProjectId(stored, config.projectId)
     const request = {
       cloudaicompanionProject: localProjectId,
       metadata: { ideType: 'IDE_UNSPECIFIED', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI', ...(localProjectId === undefined ? {} : { duetProject: localProjectId }) },
@@ -570,15 +602,22 @@ export function createGeminiService(ctx: Context, config: GeminiServiceConfig = 
     const load = await requestJson<LoadCodeAssistResponse>({ url: getMethodUrl('loadCodeAssist'), method: 'POST', body: JSON.stringify(request), headers: attributionHeaders(), signal })
     let resolvedProject = load.cloudaicompanionProject ?? localProjectId
     if (!load.currentTier) {
-      const ineligibleCode = ineligibleTierErrorCode(load.ineligibleTiers)
-      if (ineligibleCode) {
-        const message = ineligibleCode === 'GEMINI_VALIDATION_REQUIRED'
-          ? 'Gemini Code Assist account validation is required'
-          : 'Gemini Code Assist account is not eligible'
-        throw geminiError(message, ineligibleCode)
+      // An ineligible tier entry only explains why a tier is NOT offered (for
+      // example the free individual tier refusing a migrated client); it does
+      // not make the account ineligible when an allowed tier is available.
+      // Select the default allowed tier first, and only consult
+      // ineligibleTiers for the diagnosis when nothing is allowed.
+      const tier = load.allowedTiers?.find(candidate => candidate.isDefault) ?? load.allowedTiers?.[0]
+      if (!tier?.id) {
+        const ineligibleCode = ineligibleTierErrorCode(load.ineligibleTiers)
+        if (ineligibleCode) {
+          const message = ineligibleCode === 'GEMINI_VALIDATION_REQUIRED'
+            ? 'Gemini Code Assist account validation is required'
+            : 'Gemini Code Assist account is not eligible'
+          throw geminiError(message, ineligibleCode)
+        }
+        throw geminiError('Gemini Code Assist returned no default tier', 'GEMINI_NO_ALLOWED_TIER')
       }
-      const tier = load.allowedTiers?.find(candidate => candidate.isDefault)
-      if (!tier?.id) throw geminiError('Gemini Code Assist returned no default tier', 'GEMINI_NO_ALLOWED_TIER')
       if (!isFreeTier(tier) && !localProjectId) throw geminiError('A Google Cloud project is required for the selected Gemini tier', 'GEMINI_PROJECT_REQUIRED')
       const onboardRequest = {
         tierId: tier.id,
@@ -814,7 +853,7 @@ export async function* streamGemini(transport: GeminiTransport, options: Generat
         const call = functionCall as Record<string, unknown>
         const name = typeof call.name === 'string' ? call.name : 'unknown'
         const args = call.args ?? {}
-        const id = CallId(randomUUID())
+        const id = ToolCallId(randomUUID())
         const index = nextIndex++
         const argumentsJson = JSON.stringify(args)
         hasToolCall = true

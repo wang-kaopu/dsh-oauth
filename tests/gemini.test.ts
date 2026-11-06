@@ -259,6 +259,24 @@ describe('Gemini OAuth and Code Assist', () => {
     await service.dispose()
   })
 
+  it('onboards the allowed default tier even when another tier is ineligible', async () => {
+    const dshHome = await home()
+    await saveGeminiCredential({ refreshToken: 'refresh' }, dshHome)
+    let calls = 0
+    const client = fakeClient(async options => {
+      calls += 1
+      if (calls === 1) return {
+        allowedTiers: [{ id: 'standard-tier', isDefault: true }],
+        ineligibleTiers: [{ tierId: 'free-tier', reasonCode: 'UNSUPPORTED_CLIENT' }],
+      }
+      return { done: true, response: { cloudaicompanionProject: { id: 'project-id' } } }
+    })
+    const service = createGeminiService(context(), { dshHome, projectId: 'project-id', clientId: 'id', clientSecret: 'secret', createClient: () => client })
+    await expect(service.ensureGeminiCodeAssistSetup()).resolves.toEqual({ projectId: 'project-id' })
+    expect(calls).toBe(2)
+    await service.dispose()
+  })
+
   it('classifies Gaxios error response data instead of losing the upstream error code', async () => {
     const dshHome = await home()
     await saveGeminiCredential({ refreshToken: 'refresh' }, dshHome)

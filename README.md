@@ -25,6 +25,51 @@ DSH OAuth Bridge 是一个 [DeepSeek Harness](https://github.com/deepseek-ai/dee
 
 ## Install
 
+> **要求**：DeepSeek Harness **0.2.x**（已在 `0.2.1-rc.3` 上验证；不再兼容 0.1.x）。
+
+### 不等上游 merge / 发布，先用上
+
+本仓库的适配改动尚未合并或发布时，有三种方式直接使用：
+
+1. **本地路径安装（最快，本机使用）**：在 DSH 设置页的插件管理器中，
+   以本仓库的绝对路径作为安装 spec：
+
+   ```text
+   /Users/humming/Documents/ridger/dsh-oauth
+   ```
+
+   或等价地使用 `file:` 前缀。DSH 会用自己的 pnpm 链接安装并热重载；
+   之后「OAuth 登录」区块会出现在设置页中。
+
+2. **打包 tarball 安装（不依赖仓库文件夹）**：
+
+   ```sh
+   npm pack
+   # 得到 @kelvinwww-dsh-oauth-0.2.0.tgz
+   ```
+
+   在插件管理器中填入该 `.tgz` 的绝对路径（`file:/…/@kelvinwww-dsh-oauth-0.2.0.tgz`）。
+   依赖会从 npm registry 正常解析。
+
+3. **推到自己的 fork 安装（跨机器、可分享）**：
+
+   ```sh
+   git remote add mine git@github.com:<你的账号>/dsh-oauth.git
+   git push mine main
+   ```
+
+   然后在插件管理器中用 git spec 安装：
+
+   ```text
+   github:<你的账号>/dsh-oauth
+   ```
+
+   > 注意：npm 上存在同名的第三方包 `dsh-oauth`（spec 直接写 `dsh-oauth`
+   > 会解析到它，而不是本仓库）。请始终使用本仓库的完整名称
+   > `@kelvinwww/dsh-oauth`、git spec，或本地路径。
+
+### 官方发布后
+
 项目已发布到 npm：
 
 ```sh

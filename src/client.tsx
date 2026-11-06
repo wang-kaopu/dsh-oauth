@@ -10,8 +10,8 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 
 import type {
-  ClientContext,
-} from '@deepseek-ai/dsh-client-runtime/client'
+  Context,
+} from '@deepseek-ai/cordis'
 
 import type {
   PropsLocale,
@@ -19,6 +19,7 @@ import type {
 
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 
 import {
   en,
@@ -39,9 +40,15 @@ export interface OAuthStatus {
   gemini: { authenticated: boolean }
 }
 
+export interface OAuthLoginResult {
+  authUrl: string
+  /** Whether the authorization page opened in its own tab; false means the caller must offer a manual link. */
+  opened: boolean
+}
+
 export interface OAuthBridgeClient {
   status(): Promise<OAuthStatus>
-  login(provider: 'codex' | 'gemini'): Promise<void>
+  login(provider: 'codex' | 'gemini'): Promise<OAuthLoginResult>
   logout(provider: 'codex' | 'gemini'): Promise<void>
 }
 
@@ -118,13 +125,37 @@ const styles = {
 } satisfies Record<string, CSSProperties>
 
 /**
- * Create the browser-side client for the loopback OAuth control server.
+ * Create the browser-side client for the OAuth control API.
  *
- * @param baseUrl - loopback control server URL.
+ * Prefers the same-origin `/plugins/oauth-bridge` route registered on the
+ * harness `webServer` (the only path the desktop shell allows renderers to
+ * reach); falls back to the standalone loopback control server when the route
+ * is absent.
+ *
+ * @param routeUrl - same-origin control API prefix.
+ * @param fallbackUrl - standalone loopback control server URL.
  * @returns status, login, and logout operations.
  */
-export function createOAuthBridgeClient(baseUrl = 'http://127.0.0.1:1456'): OAuthBridgeClient {
+export function createOAuthBridgeClient(routeUrl = '/plugins/oauth-bridge', fallbackUrl = 'http://127.0.0.1:1456'): OAuthBridgeClient {
+  let baseUrl = routeUrl
+  let probed = false
+
+  /** Select the reachable control API once per client instance. */
+  async function probe(): Promise<void> {
+    if (probed) return
+    probed = true
+    try {
+      const response = await fetch(`${routeUrl}/status`, { method: 'GET' })
+      const body = await response.json() as Record<string, unknown>
+      if (response.ok && typeof body === 'object' && body !== null) return
+    } catch {
+      // network failure or non-JSON body: route unavailable, fall through
+    }
+    baseUrl = fallbackUrl
+  }
+
   async function call(path: string, method: 'GET' | 'POST'): Promise<Record<string, unknown>> {
+    await probe()
     const response = await fetch(`${baseUrl}${path}`, { method })
     const body = await response.json() as Record<string, unknown>
     if (!response.ok) throw new Error(typeof body.error === 'string' ? body.error : `OAuth control request failed (${response.status})`)
@@ -136,17 +167,16 @@ export function createOAuthBridgeClient(baseUrl = 'http://127.0.0.1:1456'): OAut
       return await call('/status', 'GET') as unknown as OAuthStatus
     },
     async login(provider) {
-      const popup = window.open('about:blank', '_blank')
-      if (!popup) throw new Error('OAuth popup was blocked')
-      try {
-        const result = await call(`/auth/${provider}/start`, 'POST')
-        const authUrl = result.authUrl
-        if (typeof authUrl !== 'string') throw new Error('OAuth control response did not include authUrl')
-        popup.location.href = authUrl
-      } catch (error) {
-        popup.close()
-        throw error
-      }
+      const result = await call(`/auth/${provider}/start`, 'POST')
+      const authUrl = result.authUrl
+      if (typeof authUrl !== 'string') throw new Error('OAuth control response did not include authUrl')
+      // Open the real https authorization URL directly. In the DSH desktop shell
+      // `window.open` is intercepted and http(s) targets open in the system
+      // browser while returning null; in ordinary browsers a popup blocker may
+      // also return null. Either way the caller shows the manual-link fallback.
+      const popup = window.open(authUrl, '_blank')
+      if (popup) popup.opener = null
+      return { authUrl, opened: popup !== null }
     },
     async logout(provider) {
       await call(`/auth/${provider}/logout`, 'POST')
@@ -231,6 +261,7 @@ function OAuthProviderPanel({ t }: OAuthProviderPanelProps) {
   const [status, setStatus] = useState<OAuthStatus | undefined>(undefined)
   const [busy, setBusy] = useState<'codex' | 'gemini' | undefined>(undefined)
   const [error, setError] = useState<string | undefined>(undefined)
+  const [pendingAuthUrl, setPendingAuthUrl] = useState<string | undefined>(undefined)
 
   const refresh = async (): Promise<void> => {
     try {
@@ -267,13 +298,15 @@ function OAuthProviderPanel({ t }: OAuthProviderPanelProps) {
     try {
       if (status?.[provider].authenticated) await client.logout(provider)
       else {
-        await client.login(provider)
+        const login = await client.login(provider)
+        setPendingAuthUrl(login.opened ? undefined : login.authUrl)
         await waitForAuthentication(provider, client)
       }
       await refresh()
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t('operationFailed'))
     } finally {
+      setPendingAuthUrl(undefined)
       setBusy(undefined)
     }
   }
@@ -316,6 +349,23 @@ function OAuthProviderPanel({ t }: OAuthProviderPanelProps) {
         />
       </div>
 
+      {pendingAuthUrl !== undefined
+        ? (
+          <p style={styles.error}>
+            {t('popupBlocked')}
+            {' '}
+            <a
+              href={pendingAuthUrl}
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: 'var(--dsw-alias-label-error)', textDecoration: 'underline' }}
+            >
+              {t('openAuthUrl')}
+            </a>
+          </p>
+        )
+        : null}
+
       {error !== undefined
         ? (
           <p role="alert" style={styles.error}>
@@ -332,7 +382,7 @@ function OAuthProviderPanel({ t }: OAuthProviderPanelProps) {
  *
  * @param ctx - DSH client context providing the settings and locale services.
  */
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: Context): void {
   ctx.effect(
     () => ctx.locale.register(NS, { zh, en }),
     'dsh-oauth: settings locale',
